@@ -1,25 +1,24 @@
 #include "ColumnVector.h"
 
-#include <Columns/ColumnCompressed.h>
 #include <Columns/ColumnsCommon.h>
+#include <Columns/ColumnCompressed.h>
 #include <Columns/MaskOperations.h>
 #include <Columns/RadixSortHelper.h>
-#include <IO/WriteHelpers.h>
 #include <Processors/Transforms/ColumnGathererTransform.h>
-#include <base/bit_cast.h>
-#include <base/scope_guard.h>
-#include <base/sort.h>
-#include <base/unaligned.h>
+#include <IO/WriteHelpers.h>
 #include <Common/Arena.h>
 #include <Common/Exception.h>
 #include <Common/HashTable/Hash.h>
 #include <Common/NaNUtils.h>
 #include <Common/RadixSort.h>
 #include <Common/SipHash.h>
-#include <Common/TargetSpecific.h>
 #include <Common/WeakHash.h>
+#include <Common/TargetSpecific.h>
 #include <Common/assert_cast.h>
-#include <Common/iota.h>
+#include <base/sort.h>
+#include <base/unaligned.h>
+#include <base/bit_cast.h>
+#include <base/scope_guard.h>
 
 #include <bit>
 #include <cmath>
@@ -50,6 +49,7 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
 }
 
+// 序列化一个元素到arena内存中，内存的起始位置为begin
 template <typename T>
 StringRef ColumnVector<T>::serializeValueIntoArena(size_t n, Arena & arena, char const *& begin, const UInt8 * null_bit) const
 {
@@ -75,6 +75,7 @@ StringRef ColumnVector<T>::serializeValueIntoArena(size_t n, Arena & arena, char
     return res;
 }
 
+// 从指针处读取一个原始并移动指针
 template <typename T>
 const char * ColumnVector<T>::deserializeAndInsertFromArena(const char * pos)
 {
@@ -203,6 +204,7 @@ bool ColumnVector<T>::isComparatorCompilable() const
     return std::is_integral_v<T>;
 }
 
+// llvm 优化比较函数
 template <typename T>
 llvm::Value * ColumnVector<T>::compileComparator(llvm::IRBuilderBase & builder, llvm::Value * lhs, llvm::Value * rhs, llvm::Value *) const
 {
@@ -214,12 +216,15 @@ llvm::Value * ColumnVector<T>::compileComparator(llvm::IRBuilderBase & builder, 
 
         bool is_signed = std::is_signed_v<T>;
 
+        // 设置三个变量，1，-1，0
         auto * lhs_greater_than_rhs_result = llvm::ConstantInt::getSigned(b.getInt8Ty(), 1);
         auto * lhs_less_than_rhs_result = llvm::ConstantInt::getSigned(b.getInt8Ty(), -1);
         auto * lhs_equals_rhs_result = llvm::ConstantInt::getSigned(b.getInt8Ty(), 0);
 
+        // 设置比较器
         auto * lhs_greater_than_rhs = is_signed ? b.CreateICmpSGT(lhs, rhs) : b.CreateICmpUGT(lhs, rhs);
         auto * lhs_less_than_rhs = is_signed ? b.CreateICmpSLT(lhs, rhs) : b.CreateICmpULT(lhs, rhs);
+        // 这个 llvm 的 select 组件很像 if 函数
         auto * if_lhs_less_than_rhs_result = b.CreateSelect(lhs_less_than_rhs, lhs_less_than_rhs_result, lhs_equals_rhs_result);
 
         return b.CreateSelect(lhs_greater_than_rhs, lhs_greater_than_rhs_result, if_lhs_less_than_rhs_result);
@@ -232,6 +237,7 @@ llvm::Value * ColumnVector<T>::compileComparator(llvm::IRBuilderBase & builder, 
 
 #endif
 
+// 获取 order
 template <typename T>
 void ColumnVector<T>::getPermutation(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
                                     size_t limit, int nan_direction_hint, IColumn::Permutation & res) const
@@ -245,11 +251,12 @@ void ColumnVector<T>::getPermutation(IColumn::PermutationSortDirection direction
     if (limit >= data_size)
         limit = 0;
 
-    iota(res.data(), data_size, IColumn::Permutation::value_type(0));
+    for (size_t i = 0; i < data_size; ++i)
+        res[i] = i;
 
     if constexpr (is_arithmetic_v<T> && !is_big_int_v<T>)
     {
-        if (!limit)
+        if (!limit) // 注意
         {
             /// A case for radix sort
             /// LSD RadixSort is stable
@@ -262,6 +269,7 @@ void ColumnVector<T>::getPermutation(IColumn::PermutationSortDirection direction
             bool use_radix_sort = (sort_is_stable && ascending && !std::is_floating_point_v<T>) || !sort_is_stable;
 
             /// Thresholds on size. Lower threshold is arbitrary. Upper threshold is chosen by the type for histogram counters.
+            // 这里为什么 uint32 数量的数据都用基数排序，这个复杂度岂不是很高？ O(32 n)
             if (data_size >= 256 && data_size <= std::numeric_limits<UInt32>::max() && use_radix_sort)
             {
                 bool try_sort = false;
@@ -275,7 +283,7 @@ void ColumnVector<T>::getPermutation(IColumn::PermutationSortDirection direction
                 else
                     try_sort = trySort(res.begin(), res.end(), greater_stable(*this, nan_direction_hint));
 
-                if (try_sort)
+                if (try_sort) // 这里 try sort 应该只是检验是否已经有序
                     return;
 
                 PaddedPODArray<ValueWithIndex<T>> pairs(data_size);
@@ -309,6 +317,7 @@ void ColumnVector<T>::getPermutation(IColumn::PermutationSortDirection direction
         }
     }
 
+    // 底层使用的是 pdq sort, 如果有 limit 的话用 partial_sort，做部分有序
     if (direction == IColumn::PermutationSortDirection::Ascending && stability == IColumn::PermutationSortStability::Unstable)
         this->getPermutationImpl(limit, res, less(*this, nan_direction_hint), DefaultSort(), DefaultPartialSort());
     else if (direction == IColumn::PermutationSortDirection::Ascending && stability == IColumn::PermutationSortStability::Stable)
@@ -319,6 +328,7 @@ void ColumnVector<T>::getPermutation(IColumn::PermutationSortDirection direction
         this->getPermutationImpl(limit, res, greater_stable(*this, nan_direction_hint), DefaultSort(), DefaultPartialSort());
 }
 
+// 对给的区间 equal_ranges 进行排序(这里一开始并不 equal), 结果存在 res, 并将 equal_ranges 更新为排序后的新的区间
 template <typename T>
 void ColumnVector<T>::updatePermutation(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
                                     size_t limit, int nan_direction_hint, IColumn::Permutation & res, EqualRanges & equal_ranges) const
@@ -378,6 +388,7 @@ void ColumnVector<T>::updatePermutation(IColumn::PermutationSortDirection direct
             }
         }
 
+        // 兜底使用 pdq sort
         ::sort(begin, end, pred);
     };
     auto partial_sort = [](auto begin, auto mid, auto end, auto pred) { ::partial_sort(begin, mid, end, pred); };
@@ -419,7 +430,7 @@ void ColumnVector<T>::updatePermutation(IColumn::PermutationSortDirection direct
 template <typename T>
 MutableColumnPtr ColumnVector<T>::cloneResized(size_t size) const
 {
-    auto res = this->create(size);
+    auto res = this->create(size); // COW Helper 帮忙注册的，调用的是拷贝构造函数
 
     if (size > 0)
     {
@@ -490,6 +501,7 @@ static inline UInt64 blsr(UInt64 mask)
 
 /// If mask is a number of this kind: [0]*[1]* function returns the length of the cluster of 1s.
 /// Otherwise it returns the special value: 0xFF.
+// 如果是 (1+)(0*) 这样的形式，返回前缀1的个数，否则返回 0xFF
 uint8_t prefixToCopy(UInt64 mask)
 {
     if (mask == 0)
@@ -563,15 +575,15 @@ void resize(Container & res_data, size_t reserve_size)
 
 DECLARE_AVX512VBMI2_SPECIFIC_CODE(
 template <size_t ELEMENT_WIDTH>
-inline void compressStoreAVX512(const void *src, void *dst, const UInt64 mask)
+inline void compressStoreAVX512(const void *src, void *dst, const UInt64 mask) // 根据 mask，将 src 的数据压缩存储至 dst
 {
-    __m512i vsrc = _mm512_loadu_si512(src);
+    __m512i vsrc = _mm512_loadu_si512(src); // 加载 512 bit 到寄存器
     if constexpr (ELEMENT_WIDTH == 1)
         _mm512_mask_compressstoreu_epi8(dst, static_cast<__mmask64>(mask), vsrc);
     else if constexpr (ELEMENT_WIDTH == 2)
         _mm512_mask_compressstoreu_epi16(dst, static_cast<__mmask32>(mask), vsrc);
     else if constexpr (ELEMENT_WIDTH == 4)
-        _mm512_mask_compressstoreu_epi32(dst, static_cast<__mmask16>(mask), vsrc);
+        _mm512_mask_compressstoreu_epi32(dst, static_cast<__mmask16>(mask), vsrc); // 对于 ELEMENT_WIDTH = 4 (e.g. int), 每个元素是 32 bit，一次可以处理 16 个，所以 mask 长度为 16
     else if constexpr (ELEMENT_WIDTH == 8)
         _mm512_mask_compressstoreu_epi64(dst, static_cast<__mmask8>(mask), vsrc);
 }
@@ -678,6 +690,7 @@ ColumnPtr ColumnVector<T>::filter(const IColumn::Filter & filt, ssize_t result_s
     return res;
 }
 
+// mask_size >= data_size, 将 data 拓展到 mask 的长度，mask 非 0 bit 用默认值来填充
 template <typename T>
 void ColumnVector<T>::expand(const IColumn::Filter & mask, bool inverted)
 {

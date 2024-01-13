@@ -408,7 +408,7 @@ public:
     }
 
 protected:
-    Container data;
+    Container data; // 只有这一个成员变量
 };
 
 DECLARE_DEFAULT_CODE(
